@@ -1,0 +1,6 @@
+# Gizli bilgiler - ASLA commit edilmemeli
+.env
+
+# Docker
+**/node_modules
+**/dist

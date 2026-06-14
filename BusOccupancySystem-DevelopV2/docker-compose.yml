@@ -1,0 +1,128 @@
+version: "3.9"
+
+# ===========================================================================
+# Network mimarisi
+# ---------------------------------------------------------------------------
+# public-network  : cloudflared ve frontend bu agda. cloudflared, Cloudflare'e
+#                    ciktigi (outbound) baglanti uzerinden tunel acar ve
+#                    gelen trafigi frontend:8080'e yonlendirir.
+#                    -> frontend (nginx + statik site)
+#                    -> cloudflared (Cloudflare Tunnel istemcisi)
+#
+# private-network : Disariya KAPALI (internal: true). Sadece container'lar
+#                    birbiriyle konusur, host/internet erisemez.
+#                    -> frontend (backend'e proxy_pass yapabilmek icin)
+#                    -> backend
+#                    -> postgres
+#
+# Akis:
+#   Internet -> Cloudflare Edge -> (outbound tunel) -> cloudflared -> frontend:8080 (nginx)
+#                                       |-- /            -> static dist (React)
+#                                       |-- /api/**      -> proxy_pass http://backend:8080
+#                                       |-- /ws/**       -> proxy_pass http://backend:8080 (WS upgrade)
+#                                       |-- /swagger-ui, /v3/api-docs, /actuator -> backend
+#
+#   backend, postgres'e SADECE private-network uzerinden ("postgres" DNS adi) baglanir.
+#   backend ve postgres disariya HICBIR port acmaz.
+#
+#   cloudflared, Cloudflare'e DAIMA outbound baglanti kurar; sunucuda hicbir
+#   inbound port (80/443 vb.) acmaniza gerek yoktur.
+# ===========================================================================
+
+services:
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: bus-cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN}
+    depends_on:
+      - frontend
+    # frontend ile ayni network namespace'i paylas -> cloudflared'in "localhost:8081"
+    # hedefi artik frontend container'inin kendi 8081 portuna (nginx) gider
+    network_mode: "service:frontend"
+
+  frontend:
+    build:
+      context: "./Frontend Part"
+      dockerfile: Dockerfile
+      args:
+        # Bos birakildiginda istekler ayni origin'e (nginx proxy_pass) gider
+        VITE_API_BASE_URL: ${VITE_API_BASE_URL:-}
+        VITE_BUS_WS_URL: ${VITE_BUS_WS_URL:-}
+    container_name: bus-frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    # Not: cloudflared zaten frontend:8080'e public-network uzerinden erisiyor.
+    # Bu port mapping sadece sunucuda localden test icin (curl localhost:8081).
+    # Disariya hicbir port acmak istemiyorsaniz bu iki satiri silebilirsiniz.
+    ports:
+      - "8081:8080"
+    networks:
+      - public-network
+      - private-network
+
+  backend:
+    build:
+      context: "./BusOccupancySystem-Develop"
+      dockerfile: Dockerfile
+    container_name: bus-backend
+    restart: unless-stopped
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/bus_information
+      SPRING_DATASOURCE_USERNAME: ${DB_USERNAME:-postgres}
+      SPRING_DATASOURCE_PASSWORD: ${DB_PASSWORD}
+      JWT_SECRET: ${JWT_SECRET}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Disariya port acilmiyor -> sadece frontend (nginx) private-network uzerinden erisir
+    networks:
+      - private-network
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: bus-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: bus_information
+      POSTGRES_USER: ${DB_USERNAME:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # Disariya port acilmiyor -> sadece private-network uzerinden backend erisir
+    networks:
+      - private-network
+
+  # Postgres'i tarayicidan incelemek icin (sadece host'tan erisilebilir, internete kapali)
+  adminer:
+    image: adminer:latest
+    container_name: bus-adminer
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    ports:
+      - "8082:8080"
+    networks:
+      - private-network
+      - admin-network
+
+networks:
+  public-network:
+    driver: bridge
+  private-network:
+    driver: bridge
+    internal: true
+  # internal degil -> adminer'in 8082 portu host'a acilabilir
+  admin-network:
+    driver: bridge
+
+volumes:
+  pgdata:
